@@ -146,13 +146,16 @@ async def refresh_cache():
 
     # Auto-discover calendars if none configured
     if not USER_CALENDARS and not _auto_discovered:
-        _auto_discovered = True
         discovered = await get_calendar_names()
         if discovered:
             USER_CALENDARS = discovered
+            _auto_discovered = True
             log.info(f"Auto-discovered calendars: {USER_CALENDARS}")
         else:
-            log.warning("No calendars discovered — set CALENDAR_ACCOUNTS env var")
+            # Don't latch on failure: Calendar.app is often slow/locked on cold
+            # start, so let the next background refresh retry rather than disabling
+            # calendar reads for the whole process lifetime.
+            log.warning("No calendars discovered yet — will retry on next refresh")
             return
 
     if not USER_CALENDARS:
@@ -216,7 +219,7 @@ async def get_calendar_names() -> list[str]:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
-        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5)
+        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=12)
         if proc.returncode == 0:
             return [c.strip() for c in stdout.decode().strip().split(",") if c.strip()]
     except Exception:

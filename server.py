@@ -67,6 +67,11 @@ FISH_API_URL = "https://api.fish.audio/v1/tts"
 USER_NAME = os.getenv("USER_NAME", "sir")
 PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
 _SKIP_PERMISSIONS = os.getenv("JARVIS_SKIP_PERMISSIONS", "true").lower() not in ("0", "false", "no")
+# SAFETY GATE (added during setup): [ACTION:BUILD] is disabled by default so a
+# voice command can't autonomously spawn Claude Code to build a project.
+# Flip JARVIS_ENABLE_BUILD=true in .env to re-enable. Other code actions
+# (PROMPT_PROJECT, RESEARCH, work mode) are intentionally left untouched.
+_BUILD_ENABLED = os.getenv("JARVIS_ENABLE_BUILD", "false").lower() in ("1", "true", "yes")
 
 DESKTOP_PATH = Path.home() / "Desktop"
 
@@ -2083,10 +2088,15 @@ async def voice_handler(ws: WebSocket):
                         path = str(Path.home() / "Desktop" / name)
                         os.makedirs(path, exist_ok=True)
                         Path(path, "CLAUDE.md").write_text(prompt)
-                        did = dispatch_registry.register(name, path, prompt[:200])
-                        asyncio.create_task(_execute_prompt_project(name, prompt, work_session, ws, dispatch_id=did, history=history, voice_state=voice_state))
-                        planner.reset()
-                        response_text = "Building it now, sir."
+                        if not _BUILD_ENABLED:
+                            log.warning("Planner BUILD blocked: JARVIS_ENABLE_BUILD=false")
+                            planner.reset()
+                            response_text = "Build mode is switched off right now, sir."
+                        else:
+                            did = dispatch_registry.register(name, path, prompt[:200])
+                            asyncio.create_task(_execute_prompt_project(name, prompt, work_session, ws, dispatch_id=did, history=history, voice_state=voice_state))
+                            planner.reset()
+                            response_text = "Building it now, sir."
                     elif planner.active_plan and planner.active_plan.confirmed is False and planner.active_plan.current_question_index >= len(planner.active_plan.pending_questions):
                         # Confirmation phase
                         result = await planner.handle_confirmation(user_text)
@@ -2096,10 +2106,15 @@ async def voice_handler(ws: WebSocket):
                             path = str(Path.home() / "Desktop" / name)
                             os.makedirs(path, exist_ok=True)
                             Path(path, "CLAUDE.md").write_text(prompt)
-                            did = dispatch_registry.register(name, path, prompt[:200])
-                            asyncio.create_task(_execute_prompt_project(name, prompt, work_session, ws, dispatch_id=did, history=history, voice_state=voice_state))
-                            planner.reset()
-                            response_text = "On it, sir."
+                            if not _BUILD_ENABLED:
+                                log.warning("Planner BUILD blocked: JARVIS_ENABLE_BUILD=false")
+                                planner.reset()
+                                response_text = "Build mode is switched off right now, sir."
+                            else:
+                                did = dispatch_registry.register(name, path, prompt[:200])
+                                asyncio.create_task(_execute_prompt_project(name, prompt, work_session, ws, dispatch_id=did, history=history, voice_state=voice_state))
+                                planner.reset()
+                                response_text = "On it, sir."
                         elif result["cancelled"]:
                             planner.reset()
                             response_text = "Cancelled, sir."
@@ -2236,6 +2251,11 @@ async def voice_handler(ws: WebSocket):
 
                             # Check for action tags embedded in LLM response
                             clean_response, embedded_action = extract_action(response_text)
+                            # SAFETY GATE: [ACTION:BUILD] disabled unless JARVIS_ENABLE_BUILD=true
+                            if embedded_action and embedded_action.get("action") == "build" and not _BUILD_ENABLED:
+                                log.warning("BUILD blocked: JARVIS_ENABLE_BUILD=false")
+                                response_text = "Build mode is switched off right now, sir."
+                                embedded_action = None
                             if embedded_action:
                                 log.info(f"LLM embedded action: {embedded_action}")
                                 response_text = clean_response
