@@ -2,6 +2,10 @@
 .env
 .env.local
 
+# Google OAuth client secret + authorized token
+credentials.json
+token.json
+
 # Dependencies
 node_modules/
 .venv/

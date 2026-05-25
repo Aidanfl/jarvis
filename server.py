@@ -42,7 +42,7 @@ from pydantic import BaseModel
 from actions import execute_action, monitor_build, open_terminal, open_browser, open_claude_in_project, _generate_project_name, prompt_existing_terminal, applescript_escape
 from work_mode import WorkSession, is_casual_question
 from screen import get_active_windows, take_screenshot, describe_screen, format_windows_for_context
-from calendar_access import get_todays_events, get_upcoming_events, get_next_event, format_events_for_context, format_schedule_summary, refresh_cache as refresh_calendar_cache
+from calendar_access import get_todays_events, get_upcoming_events, get_next_event, format_events_for_context, format_schedule_summary, refresh_cache as refresh_calendar_cache, cache_age_seconds as calendar_cache_age
 from mail_access import get_unread_count, get_unread_messages, get_recent_messages, search_mail, read_message, format_unread_summary, format_messages_for_context, format_messages_for_voice
 from memory import (
     remember, recall, get_open_tasks, create_task, complete_task, search_tasks,
@@ -1424,6 +1424,9 @@ async def lifespan(application: FastAPI):
 
     # Start context refresh in a separate thread (never touches event loop)
     _refresh_context_sync()
+    # Pre-warm the calendar cache in the background so the first "check my
+    # calendar" doesn't block on a ~20s AppleScript pull across all calendars.
+    asyncio.create_task(refresh_calendar_cache())
     log.info("JARVIS server starting")
 
     yield
@@ -1693,9 +1696,12 @@ async def _lookup_and_report(lookup_type: str, lookup_fn, ws, history: list[dict
 
         _active_lookups[lookup_id]["status"] = "done"
 
-        # Speak the result — skip audio if user spoke recently to avoid collision
-        if voice_state and time.time() - voice_state["last_user_time"] < 3:
-            log.info(f"Skipping lookup audio for {lookup_type} — user spoke recently")
+        # Speak the result — but skip ONLY if the user has spoken again since this
+        # lookup began (i.e. they moved on to a new request), so an explicitly
+        # requested lookup always gets answered even when it returns instantly.
+        lookup_started = _active_lookups[lookup_id]["started"]
+        if voice_state and voice_state["last_user_time"] > lookup_started:
+            log.info(f"Skipping lookup audio for {lookup_type} — superseded by a newer request")
             # Result is still stored in history below
         else:
             tts = strip_markdown_for_tts(result_text)
@@ -1737,9 +1743,15 @@ async def _lookup_and_report(lookup_type: str, lookup_fn, ws, history: list[dict
 
 
 async def _do_calendar_lookup() -> str:
-    """Slow calendar fetch — runs in thread."""
-    await refresh_calendar_cache()
+    """Calendar fetch — serves the warm cache; refreshes out-of-band if stale.
+
+    A full AppleScript pull across all calendars takes ~20s, so we never block a
+    voice request on it: get_todays_events() warms a cold cache once, and after
+    that we answer instantly and refresh in the background when the data is old.
+    """
     events = await get_todays_events()
+    if calendar_cache_age() > 600:
+        asyncio.create_task(refresh_calendar_cache())
     if events:
         _ctx_cache["calendar"] = format_events_for_context(events)
     return format_schedule_summary(events)
@@ -2210,8 +2222,17 @@ async def voice_handler(ws: WebSocket):
                             response_text = "Taking a look now, sir."
                             asyncio.create_task(_lookup_and_report("screen", _do_screen_lookup, ws, history=history, voice_state=voice_state))
                         elif action["action"] == "check_calendar":
-                            response_text = "Checking your calendar now, sir."
-                            asyncio.create_task(_lookup_and_report("calendar", _do_calendar_lookup, ws, history=history, voice_state=voice_state))
+                            # Always answer in a single clip straight from the cache
+                            # (pre-warmed at startup, kept fresh by background refreshes).
+                            # Never use the "checking..." + async-report path: when the
+                            # lookup is fast it emits two audio clips that collide on the
+                            # client and the real answer gets dropped.
+                            events = await get_todays_events()
+                            if calendar_cache_age() > 300:
+                                asyncio.create_task(refresh_calendar_cache())
+                            if events:
+                                _ctx_cache["calendar"] = format_events_for_context(events)
+                            response_text = format_schedule_summary(events)
                         elif action["action"] == "check_mail":
                             response_text = "Checking your inbox now, sir."
                             asyncio.create_task(_lookup_and_report("mail", _do_mail_lookup, ws, history=history, voice_state=voice_state))

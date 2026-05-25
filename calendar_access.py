@@ -142,6 +142,19 @@ def _parse_applescript_date(s: str) -> datetime | None:
 async def refresh_cache():
     """Refresh the event cache. Called from background loop."""
     global _event_cache, _cache_time, USER_CALENDARS, _auto_discovered
+
+    # Prefer the Google Calendar API when configured (credentials.json + token.json).
+    # Falls back to Apple Calendar / AppleScript when not set up or on any error.
+    try:
+        import google_calendar as _gcal
+        if _gcal.is_enabled():
+            _event_cache = await _gcal.fetch_todays_events()
+            _cache_time = _time.time()
+            log.info(f"Calendar cache refreshed from Google: {len(_event_cache)} events today")
+            return
+    except Exception as e:
+        log.warning(f"Google Calendar unavailable, using Apple Calendar: {e}")
+
     await _ensure_calendar_running()
 
     # Auto-discover calendars if none configured
@@ -190,6 +203,11 @@ async def get_todays_events() -> list[dict]:
         # First call — try a quick refresh
         await refresh_cache()
     return _event_cache
+
+
+def cache_age_seconds() -> float:
+    """Seconds since the event cache was last refreshed (inf if never refreshed)."""
+    return float("inf") if _cache_time == 0 else (_time.time() - _cache_time)
 
 
 async def get_upcoming_events(hours: int = 4) -> list[dict]:
