@@ -19,6 +19,16 @@ type State = "idle" | "listening" | "thinking" | "speaking";
 let currentState: State = "idle";
 let isMuted = false;
 
+// --- Wake word ("Hey JARVIS") -------------------------------------------------
+// When enabled, JARVIS only acts on utterances that begin with a wake word; all
+// other speech is ignored. Set to false for the old always-listening behavior.
+// Variants below absorb common Web Speech mishears of "Jarvis".
+const WAKE_WORD_ENABLED = true;
+const WAKE_WORDS = ["hey jarvis", "hey, jarvis", "hi jarvis", "ok jarvis", "okay jarvis", "jarvis", "hey jervis", "hey travis"];
+const WAKE_WINDOW_MS = 10000;
+let awaitingCommand = false;
+let wakeTimer: ReturnType<typeof setTimeout> | null = null;
+
 const statusEl = document.getElementById("status-text")!;
 const errorEl = document.getElementById("error-text")!;
 
@@ -32,7 +42,7 @@ function showError(msg: string) {
 
 function updateStatus(state: State) {
   const labels: Record<State, string> = {
-    idle: "",
+    idle: WAKE_WORD_ENABLED ? 'say "Hey JARVIS"' : "",
     listening: "listening...",
     thinking: "thinking...",
     speaking: "",
@@ -80,13 +90,65 @@ function transition(newState: State) {
 // Voice input
 // ---------------------------------------------------------------------------
 
+function clearWakeTimer() {
+  if (wakeTimer !== null) {
+    clearTimeout(wakeTimer);
+    wakeTimer = null;
+  }
+}
+
+// If `text` begins with a wake word, return the command after it ("" if the
+// utterance was only the wake word); otherwise return null.
+function stripWakeWord(text: string): string | null {
+  const leading = text.match(/^[\s,]*/)?.[0].length ?? 0;
+  const rest = text.slice(leading);
+  const lower = rest.toLowerCase();
+  for (const w of WAKE_WORDS) {
+    if (lower.startsWith(w)) {
+      return rest.slice(w.length).replace(/^[\s,.:!?-]+/, "").trim();
+    }
+  }
+  return null;
+}
+
+function sendCommand(text: string) {
+  audioPlayer.stop();
+  socket.send({ type: "transcript", text, isFinal: true });
+  transition("thinking");
+  awaitingCommand = false;
+  clearWakeTimer();
+}
+
+function handleUtterance(text: string) {
+  if (!WAKE_WORD_ENABLED) {
+    sendCommand(text);
+    return;
+  }
+  const afterWake = stripWakeWord(text);
+  if (afterWake !== null) {
+    audioPlayer.stop(); // wake word heard — interrupt any current speech
+    if (afterWake.length > 0) {
+      sendCommand(afterWake); // "Hey JARVIS, <command>" said in one breath
+    } else {
+      // Bare "Hey JARVIS" — wait for the command in the next utterance.
+      awaitingCommand = true;
+      transition("listening");
+      statusEl.textContent = "listening...";
+      clearWakeTimer();
+      wakeTimer = setTimeout(() => {
+        awaitingCommand = false;
+        transition("idle");
+      }, WAKE_WINDOW_MS);
+    }
+  } else if (awaitingCommand) {
+    sendCommand(text); // command following a bare wake word
+  }
+  // else: no wake word and not awaiting — ignore this speech.
+}
+
 const voiceInput = createVoiceInput(
   (text: string) => {
-    // Cancel any current JARVIS response before sending new input
-    audioPlayer.stop();
-    // User spoke — send transcript
-    socket.send({ type: "transcript", text, isFinal: true });
-    transition("thinking");
+    handleUtterance(text);
   },
   (msg: string) => {
     showError(msg);
@@ -151,7 +213,11 @@ socket.onMessage((msg) => {
 // Start listening after a brief delay for the orb to render
 setTimeout(() => {
   voiceInput.start();
-  transition("listening");
+  if (WAKE_WORD_ENABLED) {
+    updateStatus("idle"); // mic is live, but resting until it hears the wake word
+  } else {
+    transition("listening");
+  }
 }, 1000);
 
 // Resume AudioContext on ANY user interaction (browser autoplay policy)
