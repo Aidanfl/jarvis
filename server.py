@@ -1166,6 +1166,22 @@ async def synthesize_speech(text: str) -> Optional[bytes]:
 # LLM Response
 # ---------------------------------------------------------------------------
 
+
+def _pick_model(text: str) -> str:
+    """Route reasoning-heavy questions to Sonnet; keep casual chat on fast Haiku."""
+    t = text.lower()
+    hard = (
+        "explain", "why ", "why is", "how does", "how do ", "how would", "how should",
+        "compare", "difference between", "pros and cons", "analyze", "analyse",
+        "what's the best", "whats the best", "best way to", "should i", "walk me through",
+        "break down", "in depth", "deep dive", "step by step", "trade-off", "tradeoff",
+        "strategy", "plan out", "figure out", "reason through",
+    )
+    if len(t.split()) >= 18 or any(k in t for k in hard):
+        return "claude-sonnet-4-6"
+    return "claude-haiku-4-5-20251001"
+
+
 async def generate_response(
     text: str,
     client: anthropic.AsyncAnthropic,
@@ -1234,14 +1250,25 @@ async def generate_response(
     if not messages or messages[-1].get("content") != text:
         messages = messages + [{"role": "user", "content": text}]
 
+    model = _pick_model(text)
+    _tools = [{"type": "web_search_20250305", "name": "web_search", "max_uses": 3}]
+    if model != "claude-haiku-4-5-20251001":
+        log.info(f"Routing to {model} for a complex query")
+        system += ("\n\nSPOKEN REPLY: give the smart, accurate answer but keep it to 2-3 natural "
+                   "sentences for voice — no markdown, formulas, lists, or headings.")
     try:
-        response = await client.messages.create(
-            model="claude-haiku-4-5-20251001",
-            max_tokens=1024,  # room for a web search + the answer + [ACTION:X] tags
-            system=system,
-            messages=messages,
-            tools=[{"type": "web_search_20250305", "name": "web_search", "max_uses": 3}],
-        )
+        try:
+            response = await client.messages.create(
+                model=model, max_tokens=1024, system=system, messages=messages, tools=_tools,
+            )
+        except Exception as route_err:
+            if model == "claude-haiku-4-5-20251001":
+                raise
+            log.warning(f"{model} failed, falling back to Haiku: {route_err}")
+            response = await client.messages.create(
+                model="claude-haiku-4-5-20251001", max_tokens=1024,
+                system=system, messages=messages, tools=_tools,
+            )
         track_usage(response)
         # With web search the response interleaves server_tool_use / web_search_tool_result
         # blocks; the spoken answer is the text AFTER the last search result (skip Claude's
