@@ -1449,6 +1449,7 @@ async def lifespan(application: FastAPI):
     # Pre-warm the calendar cache in the background so the first "check my
     # calendar" doesn't block on a ~20s AppleScript pull across all calendars.
     asyncio.create_task(refresh_calendar_cache())
+    asyncio.create_task(_reminder_loop())  # proactive event reminders + morning briefing
     log.info("JARVIS server starting")
 
     yield
@@ -1597,6 +1598,13 @@ def detect_action_fast(text: str) -> dict | None:
                              "what's open", "whats open", "what apps are open"]):
         return {"action": "describe_screen"}
 
+    # Daily briefing — proactive rundown of the day (schedule + weather + mail + tasks)
+    if any(p in t for p in ["brief me", "morning briefing", "daily briefing", "give me a briefing",
+                             "give me my briefing", "what's my day", "whats my day",
+                             "what does my day look like", "how's my day", "hows my day",
+                             "catch me up", "the rundown", "what's on for today", "whats on for today"]):
+        return {"action": "briefing"}
+
     # Calendar — explicit schedule requests
     if any(p in t for p in ["what's my schedule", "whats my schedule", "what's on my calendar",
                              "whats on my calendar", "do i have any meetings", "any meetings",
@@ -1683,6 +1691,117 @@ async def handle_dictate_claude(prompt: str) -> str:
     except Exception as e:
         log.error(f"dictate_claude error: {e}")
         return "Something went wrong reaching the terminal, sir."
+
+
+async def handle_briefing() -> str:
+    """Compose a short spoken 'state of your day' briefing from calendar, weather, mail, tasks."""
+    events = await get_todays_events()
+    schedule = format_schedule_summary(events)
+    weather = _ctx_cache.get("weather", "")
+    mail_line = ""
+    try:
+        unread = await get_unread_count()
+        if isinstance(unread, dict):
+            mail_line = format_unread_summary(unread)
+    except Exception:
+        pass
+    task_line = ""
+    try:
+        tasks = get_open_tasks()
+        if tasks:
+            task_line = format_tasks_for_voice(tasks)
+    except Exception:
+        pass
+
+    if anthropic_client:
+        facts = (
+            f"Now: {datetime.now():%A, %B %d, %-I:%M %p}\n"
+            f"Weather: {weather or 'n/a'}\n"
+            f"Today's schedule: {schedule}\n"
+            f"Mail: {mail_line or 'n/a'}\n"
+            f"Tasks: {task_line or 'none'}"
+        )
+        try:
+            resp = await anthropic_client.messages.create(
+                model="claude-haiku-4-5-20251001",
+                max_tokens=300,
+                system=(
+                    f"You are JARVIS giving {USER_NAME} a brief spoken daily briefing. "
+                    "2-4 short sentences, British-butler tone, warm but efficient. Weave the "
+                    "schedule, weather, mail, and tasks together naturally; skip anything marked "
+                    "n/a or none. No markdown, no lists, no URLs."
+                ),
+                messages=[{"role": "user", "content": facts}],
+            )
+            track_usage(resp)
+            spoken = "".join(b.text for b in resp.content if getattr(b, "type", None) == "text").strip()
+            if spoken:
+                return spoken
+        except Exception as e:
+            log.error(f"briefing synth failed: {e}")
+
+    # Deterministic fallback if the LLM is unavailable
+    parts = [p for p in (schedule, weather, mail_line, task_line) if p]
+    return " ".join(parts) if parts else "All quiet, sir. Nothing on the books."
+
+
+# --- Proactive / ambient: event reminders + once-daily morning briefing -------
+REMINDER_LEAD_MIN = 10       # remind this many minutes before a timed event
+REMINDER_INTERVAL = 60       # check cadence (seconds)
+_reminded: set[str] = set()  # event keys already reminded today
+_reminded_day = None
+_briefed_day = None          # date the morning auto-briefing last ran
+
+
+async def _push_voice(text: str):
+    """Proactively speak `text` to every connected voice client (unprompted)."""
+    if not task_manager._websockets:
+        return  # nobody connected — don't bother synthesizing
+    audio = await synthesize_speech(text)
+    await task_manager._notify({"type": "status", "state": "speaking"})
+    if audio:
+        await task_manager._notify({"type": "audio", "data": base64.b64encode(audio).decode(), "text": text})
+    else:
+        await task_manager._notify({"type": "text", "text": text})
+    await task_manager._notify({"type": "status", "state": "idle"})
+    log.info(f"JARVIS (proactive): {text}")
+
+
+async def _reminder_loop():
+    """Background: nudge before calendar events, plus a once-daily morning briefing."""
+    global _reminded_day, _briefed_day
+    await asyncio.sleep(25)  # let startup + calendar pre-warm settle
+    log.info(f"Ambient reminder loop started (lead {REMINDER_LEAD_MIN} min)")
+    while True:
+        try:
+            if calendar_cache_age() > 300:
+                await refresh_calendar_cache()
+            now = datetime.now()
+            if _reminded_day != now.date():
+                _reminded.clear()
+                _reminded_day = now.date()
+
+            # Morning auto-briefing — once per day, in the morning, if someone's connected.
+            if task_manager._websockets and _briefed_day != now.date() and 7 <= now.hour < 11:
+                _briefed_day = now.date()
+                try:
+                    await _push_voice(await handle_briefing())
+                except Exception as e:
+                    log.debug(f"morning briefing failed: {e}")
+
+            # Event reminders — ~REMINDER_LEAD_MIN before each timed event, once each.
+            for e in await get_todays_events():
+                if e.get("all_day") or not e.get("start_dt"):
+                    continue
+                mins = (e["start_dt"] - now).total_seconds() / 60.0
+                key = f"{e.get('title', '')}@{e['start_dt'].isoformat()}"
+                if 0 < mins <= REMINDER_LEAD_MIN and key not in _reminded:
+                    _reminded.add(key)
+                    when = "in about a minute" if mins < 1.5 else f"in {round(mins)} minutes"
+                    await _push_voice(f"Sir, {e['title']} starts {when}.")
+        except Exception as ex:
+            log.debug(f"reminder loop error: {ex}")
+        await asyncio.sleep(REMINDER_INTERVAL)
 
 
 async def handle_build(target: str) -> str:
@@ -2295,6 +2414,8 @@ async def voice_handler(ws: WebSocket):
                             response_text = await handle_open_terminal()
                         elif action["action"] == "dictate_claude":
                             response_text = await handle_dictate_claude(action.get("prompt", ""))
+                        elif action["action"] == "briefing":
+                            response_text = await handle_briefing()
                         elif action["action"] == "show_recent":
                             response_text = await handle_show_recent()
                         elif action["action"] == "describe_screen":
