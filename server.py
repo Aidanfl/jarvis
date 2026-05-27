@@ -1218,6 +1218,15 @@ async def generate_response(
     if last_response:
         system += f'\n\nYOUR LAST RESPONSE (do not repeat this):\n"{last_response[:150]}"'
 
+    # Web search: answer factual/current questions from real results — don't just browse.
+    system += (
+        "\n\nWEB SEARCH: You can search the web. For factual or current questions you don't "
+        "know — what something is, game/product details, recent events — search and answer "
+        "concisely from the results. Do NOT say you don't know, and do NOT just open a browser. "
+        "Use [ACTION:BROWSE] only when the user explicitly wants to open or see a page. Keep the "
+        "spoken answer to 1-2 sentences and never read out URLs."
+    )
+
     # Use conversation history — keep the last 20 messages for context
     # (older conversation is captured in session_summary)
     messages = conversation_history[-20:]
@@ -1228,12 +1237,25 @@ async def generate_response(
     try:
         response = await client.messages.create(
             model="claude-haiku-4-5-20251001",
-            max_tokens=250,  # Extra room for [ACTION:X] tags
+            max_tokens=1024,  # room for a web search + the answer + [ACTION:X] tags
             system=system,
             messages=messages,
+            tools=[{"type": "web_search_20250305", "name": "web_search", "max_uses": 3}],
         )
         track_usage(response)
-        return response.content[0].text
+        # With web search the response interleaves server_tool_use / web_search_tool_result
+        # blocks; the spoken answer is the text AFTER the last search result (skip Claude's
+        # "I'll search..." preamble). With no search, it's just the text blocks.
+        blocks = response.content
+        last_tool = max(
+            (i for i, b in enumerate(blocks) if b.type in ("web_search_tool_result", "server_tool_use")),
+            default=-1,
+        )
+        answer_blocks = blocks[last_tool + 1:] if last_tool >= 0 else blocks
+        spoken = "".join(b.text for b in answer_blocks if getattr(b, "type", None) == "text").strip()
+        if not spoken:
+            spoken = "".join(b.text for b in blocks if getattr(b, "type", None) == "text").strip()
+        return spoken or "I couldn't find an answer to that, sir."
     except Exception as e:
         log.error(f"LLM error: {e}")
         return "Apologies, sir. I'm having trouble connecting to my language systems."
@@ -1550,8 +1572,19 @@ def detect_action_fast(text: str) -> dict | None:
                              "what's running on my", "whats running on my", "check my screen"]):
         return {"action": "describe_screen"}
 
-    # Terminal / Claude Code — explicit open requests
-    if any(w in t for w in ["open claude", "start claude", "launch claude", "run claude"]):
+    # Dictate to an open Claude Code session — "tell Claude to X", "have Claude X".
+    import re
+    _m = re.match(r"^(?:tell|ask|have)\s+claude(?:\s+code)?\s+(?:to\s+)?(.+)$", text.strip(), re.IGNORECASE)
+    if _m and _m.group(1).strip():
+        return {"action": "dictate_claude", "prompt": _m.group(1).strip()}
+
+    # Terminal / Claude Code — explicit open requests. Opens a Terminal running
+    # `claude --dangerously-skip-permissions` (see handle_open_terminal).
+    if any(w in t for w in [
+        "open claude", "open up claude", "start claude", "launch claude", "run claude",
+        "fire up claude", "boot up claude", "open a terminal", "open the terminal",
+        "open terminal", "new terminal",
+    ]):
         return {"action": "open_terminal"}
 
     # Show recent build
@@ -1603,9 +1636,53 @@ def detect_action_fast(text: str) -> dict | None:
 # -- Action Handlers -------------------------------------------------------
 
 async def handle_open_terminal() -> str:
-    claude_cmd = "claude --dangerously-skip-permissions" if _SKIP_PERMISSIONS else "claude"
-    result = await open_terminal(claude_cmd)
+    # User explicitly wants "open Claude Code" to launch a skip-permissions session,
+    # regardless of the global JARVIS_SKIP_PERMISSIONS toggle.
+    result = await open_terminal("claude --dangerously-skip-permissions")
     return result["confirmation"]
+
+
+async def handle_dictate_claude(prompt: str) -> str:
+    """Type a spoken instruction into the frontmost Terminal (where Claude Code runs).
+
+    Brings Terminal to the front and keystrokes the prompt + Return via System Events,
+    so JARVIS can drive an already-open `claude` session. Requires Accessibility
+    permission for whichever app launched the backend.
+    """
+    if not prompt.strip():
+        return "What should I tell Claude, sir?"
+    escaped = applescript_escape(prompt)
+    script = (
+        'tell application "Terminal" to activate\n'
+        'delay 0.3\n'
+        'tell application "System Events"\n'
+        '    tell process "Terminal"\n'
+        '        set frontmost to true\n'
+        '        delay 0.2\n'
+        f'        keystroke "{escaped}"\n'
+        '        delay 0.2\n'
+        '        keystroke return\n'
+        '    end tell\n'
+        'end tell'
+    )
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "osascript", "-e", script,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        _, stderr = await asyncio.wait_for(proc.communicate(), timeout=10)
+        if proc.returncode != 0:
+            err = stderr.decode()[:200]
+            log.error(f"dictate_claude failed: {err}")
+            if any(s in err.lower() for s in ("not allowed", "assistive", "accessibility", "1719")):
+                return ("I need Accessibility permission to type into Terminal, sir — "
+                        "grant it in System Settings, then try again.")
+            return "I had trouble reaching the Claude terminal, sir."
+        return "Sent that to Claude, sir."
+    except Exception as e:
+        log.error(f"dictate_claude error: {e}")
+        return "Something went wrong reaching the terminal, sir."
 
 
 async def handle_build(target: str) -> str:
@@ -2216,6 +2293,8 @@ async def voice_handler(ws: WebSocket):
                     if action:
                         if action["action"] == "open_terminal":
                             response_text = await handle_open_terminal()
+                        elif action["action"] == "dictate_claude":
+                            response_text = await handle_dictate_claude(action.get("prompt", ""))
                         elif action["action"] == "show_recent":
                             response_text = await handle_show_recent()
                         elif action["action"] == "describe_screen":
@@ -2232,7 +2311,13 @@ async def voice_handler(ws: WebSocket):
                                 asyncio.create_task(refresh_calendar_cache())
                             if events:
                                 _ctx_cache["calendar"] = format_events_for_context(events)
-                            response_text = format_schedule_summary(events)
+                            # "what's LEFT / remaining today" → drop events that already started.
+                            if any(p in t_lower for p in ("left", "remaining", "rest of", "have left", "got left", "still have", "coming up", "later today", "still on")):
+                                _now = datetime.now()
+                                events = [e for e in events if e.get("all_day") or (e.get("start_dt") and e["start_dt"] >= _now)]
+                                response_text = format_schedule_summary(events, remaining=True)
+                            else:
+                                response_text = format_schedule_summary(events)
                         elif action["action"] == "check_mail":
                             response_text = "Checking your inbox now, sir."
                             asyncio.create_task(_lookup_and_report("mail", _do_mail_lookup, ws, history=history, voice_state=voice_state))

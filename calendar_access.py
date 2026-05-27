@@ -263,16 +263,21 @@ def format_events_for_context(events: list[dict]) -> str:
     return "\n".join(lines)
 
 
-def format_schedule_summary(events: list[dict]) -> str:
-    """Format a brief voice-friendly summary of the schedule."""
+def format_schedule_summary(events: list[dict], remaining: bool = False) -> str:
+    """Format a brief voice-friendly summary of the schedule.
+
+    When remaining=True, the phrasing reflects what's left in the day, not the whole day.
+    """
     if not events:
-        return "Your schedule is clear today, sir."
+        return "Nothing left on your schedule today, sir." if remaining else "Your schedule is clear today, sir."
 
     count = len(events)
     if count == 1:
         evt = events[0]
         if evt.get("all_day"):
             return f"You have one all-day event: {evt['title']}."
+        if remaining:
+            return f"You have one event left today: {evt['title']} at {evt['start']}."
         return f"You have one event: {evt['title']} at {evt['start']}."
 
     summaries = []
@@ -282,7 +287,7 @@ def format_schedule_summary(events: list[dict]) -> str:
         else:
             summaries.append(f"{evt['title']} at {evt['start']}")
 
-    result = f"You have {count} events today. "
+    result = f"You have {count} events {'left today' if remaining else 'today'}. "
     result += ". ".join(summaries[:3])
     if count > 3:
         result += f". And {count - 3} more."
